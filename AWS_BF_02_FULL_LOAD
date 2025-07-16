@@ -1,0 +1,307 @@
+import sys
+import boto3
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.context import SparkContext
+from pyspark.sql.functions import lit, current_timestamp, col, to_date
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime
+import logging
+import json
+
+# Set up logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Parse job parameters
+args = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'SOURCE_CONNECTION_NAME',
+    'TARGET_S3_BUCKET',
+    'TABLE_CONFIG',
+    'ENVIRONMENT'
+])
+
+JOB_NAME = args['JOB_NAME']
+SOURCE_CONNECTION_NAME = args['SOURCE_CONNECTION_NAME']
+TARGET_S3_BUCKET = args['TARGET_S3_BUCKET']
+TABLE_CONFIG = json.loads(args.get('TABLE_CONFIG', '{}'))
+ENVIRONMENT = args.get('ENVIRONMENT', 'dev')
+
+# Full load table configurations with custom queries
+FULL_LOAD_TABLES = {
+    "manifestdtl": {
+        "query": """
+            SELECT actualdelqty, lotno, office, sku, audit_date, 
+                   systemgenerateid, manifesthdrid, make, partno, 
+                   qtydel, orddtlid, manifestid
+            FROM manifestdtl
+        """,
+        "primary_key": "systemgenerateid",
+        "partition_columns": ["audit_date"]
+    },
+    "billabletrack": {
+        "query": "SELECT * FROM dbo.billabletrack",
+        "primary_key": "billableid",
+        "partition_columns": ["audit_date"]
+    },
+    "invsuspend": {
+        "query": "SELECT * FROM dbo.invsuspend",
+        "primary_key": "orddtlid",
+        "partition_columns": ["audit_date"]
+    },
+    "pickupdtl": {
+        "query": "SELECT * FROM dbo.pickupdtl",
+        "primary_key": "pickupdtlid",
+        "partition_columns": ["audit_date"]
+    },
+    "pickuphdr": {
+        "query": """
+            SELECT pickupno, scheduledate, employeeno, note, stopbilldate,
+                   office, manifestid, audit_user, audit_date, audit_time,
+                   customerid, isconfirm, manifestseq, created_user,
+                   created_date, created_time, reason_why_cannot_sign,
+                   signature_date, employeeid, stmethod 
+            FROM pickuphdr
+        """,
+        "primary_key": "pickupno",
+        "partition_columns": ["audit_date"]
+    },
+    "busi_src": {
+        "query": """
+            SELECT address, busi_src_type, city, name, state,
+                   systemgenerateid, zip, audit_date
+            FROM busi_src
+        """,
+        "primary_key": "systemgenerateid",
+        "partition_columns": ["audit_date"]
+    },
+    "hcpcs_span": {
+        "query": "SELECT * FROM hcpcs_span",
+        "primary_key": None,  # No clear PK
+        "partition_columns": []
+    },
+    "rent2sale": {
+        "query": "SELECT * FROM rent2sale",
+        "primary_key": None,
+        "partition_columns": []
+    },
+    "invstatus_audit": {
+        "query": "SELECT * FROM invstatus_audit",
+        "primary_key": None,
+        "partition_columns": ["audit_date"]
+    },
+    "orderchecklist": {
+        "query": "SELECT * FROM orderchecklist",
+        "primary_key": "sysid",
+        "partition_columns": ["auditdate"],
+        "rename_columns": {
+            "sysid": "SysId",
+            "ordernumber": "OrderNumber",
+            "itemid": "ItemId",
+            "status": "Status",
+            "audituser": "AuditUser",
+            "auditdate": "AuditDate",
+            "audittime": "AuditTime"
+        }
+    },
+    "order_classification": {
+        "query": """
+            SELECT systemgenerateid, description, order_type_id
+            FROM order_classification
+        """,
+        "primary_key": "systemgenerateid",
+        "partition_columns": []
+    },
+    "mnclose": {
+        "query": """
+            SELECT systemgenerateid, fromclosedate, toclosedate, office,
+                   audit_user, audit_date, audit_time
+            FROM mnclose
+        """,
+        "primary_key": "systemgenerateid",
+        "partition_columns": ["audit_date"]
+    },
+    "PA_X_HCPCS": {
+        "query": "SELECT * FROM PA_X_HCPCS",
+        "primary_key": "sysid",
+        "partition_columns": ["audit_date"]
+    },
+    "claim_incomplete": {
+        "query": "SELECT * FROM claim_incomplete",
+        "primary_key": None,
+        "partition_columns": []
+    }
+}
+
+def get_jdbc_connection(glue_client, connection_name):
+    """Get JDBC connection details from Glue connection"""
+    try:
+        conn = glue_client.get_connection(Name=connection_name)['Connection']
+        conn_props = conn['ConnectionProperties']
+        jdbc_url = conn_props['JDBC_CONNECTION_URL']
+        if not jdbc_url.startswith('jdbc:'):
+            jdbc_url = f"jdbc:postgresql://{jdbc_url}"
+        return {
+            'url': jdbc_url,
+            'user': conn_props.get("USERNAME", ""),
+            'password': conn_props.get("PASSWORD", "")
+        }
+    except Exception as e:
+        logger.error(f"Failed to get connection details: {str(e)}")
+        raise
+
+def process_full_load_table(spark, conn_details, table_name, config, glue_context):
+    """Process full load for a single table"""
+    logger.info(f"Processing full load for table: {table_name}")
+    
+    try:
+        # Execute query
+        query = f"({config['query']}) as src"
+        
+        df = spark.read.jdbc(
+            url=conn_details['url'],
+            table=query,
+            properties={
+                "user": conn_details['user'],
+                "password": conn_details['password'],
+                "driver": "org.postgresql.Driver",
+                "fetchsize": "10000"
+            }
+        )
+        
+        record_count = df.count()
+        logger.info(f"Records fetched for {table_name}: {record_count}")
+        
+        if record_count == 0:
+            logger.warning(f"No data found for table {table_name}")
+            return 0
+        
+        # Rename columns if specified
+        if 'rename_columns' in config:
+            for old_name, new_name in config['rename_columns'].items():
+                if old_name in df.columns:
+                    df = df.withColumnRenamed(old_name, new_name)
+        
+        # Add ETL metadata
+        df = df.withColumn("etl_load_timestamp", current_timestamp()) \
+               .withColumn("etl_job_name", lit(JOB_NAME)) \
+               .withColumn("etl_load_type", lit("full")) \
+               .withColumn("etl_environment", lit(ENVIRONMENT))
+        
+        # Ensure partition columns exist
+        partition_cols = config.get('partition_columns', [])
+        for pcol in partition_cols:
+            if pcol not in df.columns and pcol == "audit_date":
+                # If audit_date doesn't exist, create it from current date
+                df = df.withColumn("audit_date", to_date(current_timestamp()))
+        
+        # Convert to DynamicFrame
+        dyf = DynamicFrame.fromDF(df, glue_context, f"dyf_{table_name}")
+        
+        # Define output path
+        output_path = f"s3://{TARGET_S3_BUCKET}/bf/bf_{table_name}/"
+        
+        # Write to S3 (overwrite mode for full loads)
+        if partition_cols:
+            glue_context.write_dynamic_frame.from_options(
+                frame=dyf,
+                connection_type="s3",
+                connection_options={
+                    "path": output_path,
+                    "partitionKeys": partition_cols
+                },
+                format="parquet",
+                format_options={
+                    "compression": "snappy"
+                },
+                transformation_ctx=f"write_{table_name}"
+            )
+        else:
+            # No partitions - simple overwrite
+            glue_context.write_dynamic_frame.from_options(
+                frame=dyf,
+                connection_type="s3",
+                connection_options={
+                    "path": output_path
+                },
+                format="parquet",
+                format_options={
+                    "compression": "snappy"
+                },
+                transformation_ctx=f"write_{table_name}"
+            )
+        
+        logger.info(f"✅ Successfully wrote {record_count} records for {table_name}")
+        logger.info(f"📁 Output location: {output_path}")
+        
+        return record_count
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to process table {table_name}: {str(e)}")
+        raise
+
+def main():
+    """Main execution function"""
+    sc = SparkContext()
+    glue_context = GlueContext(sc)
+    spark = glue_context.spark_session
+    job = Job(glue_context)
+    job.init(JOB_NAME, args)
+    
+    # Set Spark configurations
+    spark.conf.set("spark.sql.adaptive.enabled", "true")
+    spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+    
+    total_records_processed = 0
+    successful_tables = []
+    failed_tables = []
+    
+    try:
+        # Get connection details
+        glue_client = boto3.client('glue')
+        conn_details = get_jdbc_connection(glue_client, SOURCE_CONNECTION_NAME)
+        
+        # Merge custom configs with defaults
+        tables_to_process = {**FULL_LOAD_TABLES, **TABLE_CONFIG}
+        
+        logger.info(f"🚀 Starting full load for {len(tables_to_process)} tables")
+        logger.info(f"Environment: {ENVIRONMENT}")
+        logger.info(f"Target S3: {TARGET_S3_BUCKET}")
+        
+        # Process each table
+        for table_name, config in tables_to_process.items():
+            try:
+                logger.info(f"🔄 Processing {table_name} (full load)")
+                records_processed = process_full_load_table(
+                    spark, conn_details, table_name, config, glue_context
+                )
+                total_records_processed += records_processed
+                successful_tables.append(table_name)
+                logger.info(f"✅ Successfully processed: {table_name}")
+                
+            except Exception as e:
+                logger.error(f"❌ Failed processing {table_name}: {str(e)}")
+                failed_tables.append(table_name)
+                continue
+        
+        # Job summary
+        logger.info("=" * 60)
+        logger.info(f"Job completed!")
+        logger.info(f"Total records processed: {total_records_processed}")
+        logger.info(f"Successful tables ({len(successful_tables)}): {', '.join(successful_tables)}")
+        
+        if failed_tables:
+            logger.error(f"Failed tables ({len(failed_tables)}): {', '.join(failed_tables)}")
+            # Don't fail the entire job if some tables fail
+            # raise Exception(f"Some tables failed to process: {failed_tables}")
+    
+    except Exception as e:
+        logger.error(f"Job failed with error: {str(e)}")
+        raise
+    finally:
+        job.commit()
+
+if __name__ == "__main__":
+    main()
